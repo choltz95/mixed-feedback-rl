@@ -23,7 +23,7 @@ args = parser.parse_args()
 
 net_init, net_apply, net_walk = pwl(
     Dense(1024), Relu,
-    Dense(4),
+    Dense(2),
 )
 
 params = pickle.load(open(args.mpath,'rb'))
