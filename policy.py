@@ -1,24 +1,33 @@
 from jax import numpy as jnp
+from jax import lax
+from jax import device_put
 from jax import random, grad, vmap, jit, tree_multimap
 from jax.experimental import stax, optimizers
 from jax.experimental.stax import Conv, Dense, MaxPool, Relu, Flatten, LogSoftmax
 import sys, os, math, time, pickle, itertools
 import numpy as np
-
+from functools import partial
 from tqdm.notebook import tqdm
 
 
 class Policy:
     def __init__(self, rng, in_shape, net, env=None, name='policy', losstype='mse', discrete=False, trainable=True, cost_sensitive=False, constrained=False, active=False):
-        self.trainable=trainable
+        self.active = active # is this an active learning policy?
+        self.discrete = discrete # is this a discrete environment? 
+        self.trainable = trainable # is this a trainable policy?
         self.training=False
+        self.done = False
         
         self.env = env
-        self.cur_obs=None
-        self.discrete = discrete
+        self.cur_obs=None 
+        self.Vs = [jnp.array([1])]
+        self.r_t = [1]
+        self.dsct_fctr = 0.95
         
         self.expert_observations = []
         self.expert_actions = []
+        self.self_observations = []
+        self.self_actions = []
         
         self.episode_rewards = []
         self.rollout_rewards = [] # rewards for current rollout
@@ -28,14 +37,22 @@ class Policy:
                 
         self.X = jnp.array([])
         self.y = jnp.array([])
+
+        self.X_expert = jnp.array([])
+        self.y_expert = jnp.array([])
+        self.X_self = jnp.array([])
+        self.y_self = jnp.array([])
         
         self.self_X = jnp.array([])
         self.self_y = jnp.array([])
         
         self.active_mask = jnp.array([],dtype=jnp.bool_) # active learning mask
+        self.cur_active_mask = []
+        self.self_mask = jnp.array([],dtype=jnp.bool_) # active learning mask
+        self.cur_self_mask = []
         self.importance_weights = jnp.array([])  # aggrevate weights
         self.cost_sensitive = cost_sensitive
-        self.active = active
+        
         self.confs = []
         
         self.init_params = ()
@@ -78,96 +95,122 @@ class Policy:
             self.opt_state = self.opt_init(self.init_params)
             self.params = self.init_params
             self.training=True
+            self.cur_active_mask = []
+            self.cur_self_mask = []
         self.rewards.append([])
         self.confs.append([])
+        self.expert_observations = []
+        self.expert_actions = []
+        self.self_observations = []
+        self.self_actions = []
 
     """
     Reset environment before rollout
     """
     def reset_env(self):
         self.cur_obs = self.env.reset()
+        self.done=False
         self.reward_accum = 0.0
+        self.r_t = [1]
+   
+    @partial(jit, static_argnums=(0,))
+    def value_fn(self, d_i, d_i_til):
+        V = (jnp.triu(jnp.power(self.dsct_fctr, d_i_til - d_i_til.T))*(-jnp.array(self.r_t))).sum(axis=1)
+        V = (V - V.mean())/V.std() + 1 
+        return V
         
     """
     Take single env step
     """
-    def step(self):
+    def step(self, d_i):
         logits, action, conf = self.take_action(self.cur_obs)
         if not self.discrete:
             action = logits
         obs, r, done, info = self.env.step(np.array(action))
+        if done:
+            d_i_ar = jnp.arange(0,d_i)
+            d_i_til = jnp.tile(d_i_ar,(d_i,1))
+            V = self.value_fn(d_i, d_i_til)
+            self.Vs.append(V)
+            self.done=True
         self.cur_obs = obs
         self.reward_accum += r
         return obs, r, done
-
-    """
-    Apply policy net to an observation
-    """
-    def apply_policy(self,obs):
-        #obs = (obs - self.std_mean)/(self.std_std+1e-6)
-        return self.net_apply(self.params, obs)
-            
+    
+    @partial(jit, static_argnums=(0,))
+    def _take_action(self, params, obs):
+        logits = self.net_apply(params, obs)
+        softm_logits = stax.softmax(logits.flatten())
+        sorted_logits = jnp.sort(softm_logits)
+        conf = sorted_logits[-1] - sorted_logits[-2]
+        action = jnp.argmax(logits)
+        return logits,action,conf  
+    
     """
     Apply policy and return logits, action, confidence
     """
     def take_action(self, obs):
         #obs = (obs - self.std_mean)/(self.std_std+1e-6)
-        logits = self.net_apply(self.params, obs)
-        softm_logits = stax.softmax(logits.flatten())
-        sorted_logits = np.sort(softm_logits)
-        conf = sorted_logits[-1] - sorted_logits[-2]
-        action = np.argmax(logits)
-        return logits, action, conf
-         
+        return self._take_action(self.params, obs)
+    
+    @partial(jit, static_argnums=(0,))
+    def tr_step(self, params, i, opt_state, batch):
+        x1, y1, w = batch
+        p = params
+        g = grad(self.loss)(p, x1, y1, w)
+        return self.opt_update(i, g, opt_state)
+
+    @partial(jit, static_argnums=(0,))
+    def tr_constraint_step(self, params, i, opt_state, inputs, cons):
+        x, y, w = inputs
+        cx, cy, w = cons
+        p = params
+        def reg(p,x,cx,cy):
+            return self.m_reg(p,x,cx)
+        g = grad(reg)(p, x, cx, cy)
+        return self.opt_update(i, g, opt_state)    
+        
     """
     Train policy on current data
     """
     def fit_policy(self,constraints=(),batch_size=64, epochs=30):
         assert self.trainable
-        @jit
-        def step(i, opt_state, batch):
-            x1, y1, w = batch
-            p = self.get_params(opt_state)
-            g = grad(self.loss)(p, x1, y1, w)
-            #self.g1.append(g)
-            return self.opt_update(i, g, opt_state)
-
-        @jit
-        def constraint_step(i, opt_state, inputs, constraints):
-            x, y, w = inputs
-            cx,cy = constraints
-            p = self.get_params(opt_state)
-            def reg(p,x,cx,cy):
-                #return self.barrier(p,cx,cy) + 10.0*self.m_reg(p,x,cx)
-                return self.m_reg(p,x,cx)
-            g = grad(reg)(p, x, cx, cy)
-            #self.g2.append(g)
-            return self.opt_update(i, g, opt_state)
-        X_tr = self.X[self.active_mask,:]
-        y_tr = self.y[self.active_mask,:]
-        w = self.importance_weights[self.active_mask]
+        if self.active:
+            #X_tr = jnp.concatenate([self.X_expert[self.active_mask,:],self.X_self[~self.active_mask,:]])
+            #y_tr = jnp.concatenate([self.y_expert[self.active_mask,:],self.y_self[~self.active_mask,:]])
+            X_tr = jnp.concatenate([self.X_expert[self.active_mask,:],self.X_self[self.self_mask]])
+            y_tr = jnp.concatenate([self.y_expert[self.active_mask,:],self.y_self[self.self_mask]])
+            w = jnp.concatenate([self.importance_weights[self.active_mask],self.importance_weights[self.self_mask]])
+        else:
+            X_tr = self.X_expert[self.active_mask,:]
+            y_tr = self.y_expert[self.active_mask,:]
+            w = self.importance_weights[self.active_mask]
                     
         num_train = X_tr.shape[0]
         num_complete_batches, leftover = divmod(num_train, batch_size)
         num_batches = num_complete_batches + bool(leftover)
         
-        def data_stream():
+        def data_stream(X,y):
             while True:
                 rng = np.random.RandomState(0)
                 perm = rng.permutation(num_train)
                 for i in range(num_batches):
                     batch_idx = perm[i * batch_size:(i + 1) * batch_size]
-                    yield X_tr[batch_idx], y_tr[batch_idx], w[batch_idx]
-        batches = data_stream()
+                    yield X[batch_idx], y[batch_idx], w[batch_idx]
+                    
+        batches = data_stream(X_tr,y_tr)
+        batches_constraints = data_stream(self.X_expert, self.y_expert)
         itercount = itertools.count()
 
         for epoch in tqdm(range(epochs),desc='tr policy', position=2, leave=False):
             for _ in range(num_batches):
                 ii = next(itercount)
                 b = next(batches)
-                self.opt_state = step(ii, self.opt_state, b)
-                if self.constrained and len(constraints)>0:
-                    self.opt_state = constraint_step(ii, self.opt_state, b, constraints)
+                c = next(batches_constraints)
+                p = self.get_params(self.opt_state)
+                self.opt_state = self.tr_step(p, ii, self.opt_state, b)
+                if self.constrained:
+                    self.opt_state = self.tr_constraint_step(p, ii, self.opt_state, b, c)
 
         params = self.get_params(self.opt_state)
         self.params = params
@@ -175,7 +218,48 @@ class Policy:
     """
     Aggregate data
     """
-    def aggregate(self, data, weights=None, mask=None):
+    def aggregate(self, data=None, weights=None, mask=None):        
+        if data:
+            expert_observations, expert_actions = data#[0]
+            self_observations, self_actions = data#[1]
+            if weights is None:
+                weights = jnp.ones(len(expert_observations))
+            if mask is None:
+                mask = jnp.ones(len(expert_observations), dtype=jnp.bool_)
+                self_mask = jnp.ones(len(expert_observations), dtype=jnp.bool_)
+        else:
+            expert_observations, expert_actions = (self.expert_observations, self.expert_actions)
+            self_observations, self_actions = (self.self_observations, self.self_actions)
+            weights = jnp.concatenate(self.Vs)
+            mask = jnp.array(self.cur_active_mask, dtype=jnp.bool_)
+            self_mask = jnp.array(self.cur_self_mask, dtype=jnp.bool_)
+        
+        if not self.active:
+            mask = jnp.ones(len(expert_observations), dtype=jnp.bool_)
+        if not self.cost_sensitive:
+            weights = jnp.ones_like(weights)
+
+        if len(self.num_data) == 0:
+            self.X_expert = jnp.array(expert_observations)
+            self.y_expert = jnp.array(expert_actions)
+            self.X_self = jnp.array(self_observations)
+            self.y_self = jnp.array(self_actions)
+            self.importance_weights = weights
+            self.active_mask  = mask
+            self.self_mask = self_mask
+        else:
+            self.X_expert = jnp.concatenate((self.X_expert, jnp.array(expert_observations)))
+            self.y_expert = jnp.concatenate((self.y_expert, jnp.array(expert_actions)))
+            if len(self_observations) > 0:
+                self.X_self = jnp.concatenate((self.X_self, jnp.array(self_observations)))
+                self.y_self = jnp.concatenate((self.y_self, jnp.array(self_actions)))
+            self.importance_weights = jnp.concatenate((self.importance_weights, jnp.array(weights)))
+            self.active_mask = jnp.concatenate((self.active_mask, jnp.array(mask)))
+            self.self_mask = jnp.concatenate((self.self_mask, jnp.array(self_mask)))
+            
+        self.num_data.append(self.active_mask.sum().item())
+        
+    def aggregate_old(self, data, weights=None, mask=None):
         new_observations, new_actions = data
         if weights is None:
             weights = jnp.ones(new_observations.shape[0])
